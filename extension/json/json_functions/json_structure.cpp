@@ -774,6 +774,120 @@ static LogicalType StructureToTypeString(const JSONStructureNode &node) {
 	return desc.candidate_types.back();
 }
 
+static LogicalType StructureToTypeUnion(ClientContext &context,
+                                        const JSONStructureNode &node,
+                                        const idx_t max_depth,
+                                        const double field_appearance_threshold,
+                                        const idx_t map_inference_threshold,
+                                        const idx_t depth,
+                                        const LogicalType &null_type) {
+	D_ASSERT(node.descriptions.size() > 1);
+
+	// Build unique, stable UNION members
+	child_list_t<LogicalType> members;
+	members.reserve(node.descriptions.size());
+
+	unordered_set<LogicalTypeId> seen_ids;
+	unordered_set<string> seen_tags;
+
+	for (const auto &desc : node.descriptions) {
+		D_ASSERT(desc.type != LogicalTypeId::INVALID);
+
+		LogicalType member_type;
+
+		switch (desc.type) {
+		case LogicalTypeId::LIST: {
+			// LIST uses desc.children[0] as the element aggregator, if present
+			LogicalType elem_type = LogicalType::JSON();
+			if (!desc.children.empty()) {
+				// recurse one level deeper on the element node
+				elem_type = JSONStructure::StructureToType(context, desc.children[0], max_depth,
+				                                           field_appearance_threshold, map_inference_threshold,
+				                                           depth + 1, null_type);
+			}
+			member_type = LogicalType::LIST(std::move(elem_type));
+			break;
+		}
+		case LogicalTypeId::STRUCT: {
+			// STRUCT: walk key_map -> children to build named fields
+			child_list_t<LogicalType> fields;
+			fields.reserve(desc.children.size());
+
+			// Collect (name, idx) pairs first so we can sort for determinism
+			vector<pair<string, idx_t>> name_idx;
+			name_idx.reserve(desc.key_map.size());
+			for (const auto &kv : desc.key_map) {
+				// If the key type isn’t std::string in your tree, adapt this:
+				//   - if it’s string_t: std::string name = kv.first.GetString();
+				//   - if it’s a custom key wrapper: name = kv.first.ToString();
+				// AFTER
+				const auto &jk = kv.first;                // jk is JSONKey
+				std::string name(jk.ptr, jk.len);         // make an owning std::string
+				name_idx.emplace_back(std::move(name), kv.second);
+			}
+			std::sort(name_idx.begin(), name_idx.end(),
+					[](const std::pair<std::string, idx_t> &a,
+						const std::pair<std::string, idx_t> &b) {
+						return a.first < b.first;
+					});
+
+			for (const auto &ni : name_idx) {
+				const auto &child_node = desc.children[ni.second];
+				auto field_type = JSONStructure::StructureToType(context, child_node, max_depth,
+				                                                 field_appearance_threshold, map_inference_threshold,
+				                                                 depth + 1, null_type);
+				fields.emplace_back(ni.first, std::move(field_type));
+			}
+
+			member_type = LogicalType::STRUCT(std::move(fields));
+			break;
+		}
+		case LogicalTypeId::VARCHAR:
+			// String auto-detection (dates/booleans) is normally done via node aggregation.
+			// For the UNION case we keep it simple and return VARCHAR.
+			member_type = LogicalType::VARCHAR;
+			break;
+		case LogicalTypeId::UBIGINT:
+			// Normalize to BIGINT like the single-type path
+			member_type = LogicalType::BIGINT;
+			break;
+		case LogicalTypeId::SQLNULL:
+			member_type = null_type;
+			break;
+		default:
+			member_type = LogicalType(desc.type);
+			break;
+		}
+
+		// Deduplicate by LogicalTypeId to avoid UNION(BIGINT,BIGINT) etc.
+		if (!seen_ids.insert(member_type.id()).second) {
+			continue;
+		}
+
+		// Stable, readable tag name
+		string tag = EnumUtil::ToString(member_type.id());
+		if (!seen_tags.insert(tag).second) {
+			// disambiguate duplicate tags (very rare after id-dedupe)
+			for (idx_t i = 2;; i++) {
+				auto cand = tag + "_" + std::to_string(i);
+				if (seen_tags.insert(cand).second) {
+					tag = cand;
+					break;
+				}
+			}
+		}
+		members.emplace_back(std::move(tag), std::move(member_type));
+	}
+
+	// If all members collapsed to one type, return that type
+	if (members.size() == 1) {
+		return members[0].second;
+	}
+	return LogicalType::UNION(std::move(members));
+}
+
+
+
 LogicalType JSONStructure::StructureToType(ClientContext &context, const JSONStructureNode &node, const idx_t max_depth,
                                            const double field_appearance_threshold, const idx_t map_inference_threshold,
                                            const idx_t depth, const LogicalType &null_type) {
@@ -783,9 +897,11 @@ LogicalType JSONStructure::StructureToType(ClientContext &context, const JSONStr
 	if (node.descriptions.empty()) {
 		return null_type;
 	}
-	if (node.descriptions.size() != 1) { // Inconsistent types, so we resort to JSON
-		return LogicalType::JSON();
+	if (node.descriptions.size() != 1) {
+		return StructureToTypeUnion(context, node, max_depth, field_appearance_threshold,
+									map_inference_threshold, depth, null_type);
 	}
+
 	auto &desc = node.descriptions[0];
 	D_ASSERT(desc.type != LogicalTypeId::INVALID);
 	switch (desc.type) {

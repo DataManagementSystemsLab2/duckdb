@@ -780,76 +780,183 @@ bool TransformToJSON(yyjson_val *vals[], yyjson_alc *alc, Vector &result, const 
 	return true;
 }
 
+static idx_t FindUnionMemberById(const child_list_t<LogicalType> &members, LogicalTypeId want) {
+	for (idx_t i = 0; i < members.size(); i++) {
+		if (members[i].second.id() == want) {
+			return i;
+		}
+	}
+	return DConstants::INVALID_INDEX;
+}
+
+static bool TryTransformIntoMember(yyjson_val *val,
+                                   const LogicalType &member_type,
+                                   yyjson_alc *alc,
+                                   JSONTransformOptions &parent_opts,
+                                   Value &out_value) {
+	// Trial transform into a single-member vector without surfacing errors
+	JSONTransformOptions trial_opts(false, false, false, false);
+	trial_opts.delay_error = true;
+	trial_opts.date_format_map = parent_opts.date_format_map;
+
+	Vector tmp(member_type, 1);
+	if (!JSONTransform::Transform(&val, alc, tmp, 1, trial_opts, nullptr)) {
+		return false;
+	}
+	if (!FlatVector::Validity(tmp).RowIsValid(0)) {
+		return false;
+	}
+	out_value = tmp.GetValue(0);
+	return true;
+}
+
 bool TransformValueIntoUnion(yyjson_val **vals, yyjson_alc *alc, Vector &result, const idx_t count,
                              JSONTransformOptions &options) {
-	auto type = result.GetType();
+	const LogicalType type = result.GetType();
+	const auto fields = UnionType::CopyMemberTypes(type);
 
-	auto fields = UnionType::CopyMemberTypes(type);
-	vector<string> names;
-	for (const auto &field : fields) {
-		names.push_back(field.first);
+	// Cache tags (member names) for explicit {"TAG": value} path
+	vector<string> tags;
+	tags.reserve(fields.size());
+	for (idx_t m = 0; m < fields.size(); m++) {
+		tags.push_back(fields[m].first);
 	}
 
 	bool success = true;
-
 	auto &validity = FlatVector::Validity(result);
 
-	auto set_error = [&](idx_t i, const string &message) {
-		validity.SetInvalid(i);
-		result.SetValue(i, Value(nullptr));
-		if (success && options.strict_cast) {
-			options.error_message = message;
-			options.object_index = i;
-			success = false;
+	// Small helper to set row error according to 'strict_cast'
+	struct Err {
+		static void Set(idx_t row, const string &msg, Vector &res, ValidityMask &mask,
+		                JSONTransformOptions &opts, bool &succ) {
+			mask.SetInvalid(row);
+			res.SetValue(row, Value(nullptr));
+			if (succ && opts.strict_cast) {
+				opts.error_message = msg;
+				opts.object_index = row;
+				succ = false;
+			}
 		}
 	};
 
 	for (idx_t i = 0; i < count; i++) {
-		const auto &obj = vals[i];
+		yyjson_val *v = vals[i];
 
-		if (!obj || unsafe_yyjson_is_null(vals[i])) {
+		// NULL -> NULL
+		if (!v || unsafe_yyjson_is_null(v)) {
 			validity.SetInvalid(i);
 			result.SetValue(i, Value(nullptr));
 			continue;
 		}
 
-		if (!unsafe_yyjson_is_obj(obj)) {
-			set_error(i,
-			          StringUtil::Format("Expected an object representing a union, got %s", yyjson_get_type_desc(obj)));
-			continue;
+		// 1) Explicit union wrapper only if the key matches a known tag; otherwise fall back.
+		if (unsafe_yyjson_is_obj(v)) {
+			const size_t len = unsafe_yyjson_get_len(v);
+			if (len == 1) {
+				auto key = unsafe_yyjson_get_first(v);
+				auto uval = yyjson_obj_iter_get_val(key);
+				const char *key_cstr = unsafe_yyjson_get_str(key);
+
+				// lookup tag index
+				idx_t tag_idx = DConstants::INVALID_INDEX;
+				for (idx_t t = 0; t < (idx_t)tags.size(); t++) {
+					if (tags[t] == key_cstr) { tag_idx = t; break; }
+				}
+
+				if (tag_idx != DConstants::INVALID_INDEX) {
+					// explicit {"TAG": value} – keep strict behavior
+					Vector single(UnionType::GetMemberType(type, tag_idx), 1);
+					if (!JSONTransform::Transform(&uval, alc, single, 1, options, nullptr)) {
+						success = false;
+					} else {
+						result.SetValue(i, Value::UNION(fields, tag_idx, single.GetValue(0)));
+					}
+					continue; // handled this row
+				}
+				// else: single-key object but not a union tag -> treat as a normal object (fall through)
+			}
+			// len != 1: also fall through to auto-selection
 		}
 
-		auto len = unsafe_yyjson_get_len(obj);
-		if (len > 1) {
-			set_error(i, "Found object containing more than one key, instead of union");
-			continue;
-		} else if (len == 0) {
-			set_error(i, "Found empty object, instead of union");
-			continue;
+		// 2) Auto-selection: pick an arm based on the JSON "kind", then try others as fallback.
+
+		// Build a preferred order of candidate member indices
+		vector<idx_t> candidates;
+		candidates.reserve(fields.size());
+
+		const auto tag_val = unsafe_yyjson_get_tag(v);
+		// Objects: prefer STRUCT
+		if (unsafe_yyjson_is_obj(v)) {
+			const idx_t struct_idx = FindUnionMemberById(fields, LogicalTypeId::STRUCT);
+			if (struct_idx != DConstants::INVALID_INDEX) candidates.push_back(struct_idx);
+		}
+		// Arrays: prefer LIST, then ARRAY
+		if (unsafe_yyjson_is_arr(v)) {
+			const idx_t list_idx  = FindUnionMemberById(fields, LogicalTypeId::LIST);
+			const idx_t array_idx = FindUnionMemberById(fields, LogicalTypeId::ARRAY);
+			if (list_idx  != DConstants::INVALID_INDEX) candidates.push_back(list_idx);
+			if (array_idx != DConstants::INVALID_INDEX) candidates.push_back(array_idx);
+		}
+		// Booleans
+		if (unsafe_yyjson_is_bool(v)) {
+			const idx_t bool_idx = FindUnionMemberById(fields, LogicalTypeId::BOOLEAN);
+			if (bool_idx != DConstants::INVALID_INDEX) candidates.push_back(bool_idx);
+		}
+		// Numbers: prefer BIGINT for ints, DOUBLE for reals (trial will refine further, e.g. DECIMAL)
+		if ((tag_val == (YYJSON_TYPE_NUM | YYJSON_SUBTYPE_UINT)) ||
+		    (tag_val == (YYJSON_TYPE_NUM | YYJSON_SUBTYPE_SINT))) {
+			const idx_t i64_idx = FindUnionMemberById(fields, LogicalTypeId::BIGINT);
+			if (i64_idx != DConstants::INVALID_INDEX) candidates.push_back(i64_idx);
+			const idx_t dbl_idx = FindUnionMemberById(fields, LogicalTypeId::DOUBLE);
+			if (dbl_idx != DConstants::INVALID_INDEX) candidates.push_back(dbl_idx);
+		} else if (tag_val == (YYJSON_TYPE_NUM | YYJSON_SUBTYPE_REAL)) {
+			const idx_t dbl_idx = FindUnionMemberById(fields, LogicalTypeId::DOUBLE);
+			if (dbl_idx != DConstants::INVALID_INDEX) candidates.push_back(dbl_idx);
+			const idx_t i64_idx = FindUnionMemberById(fields, LogicalTypeId::BIGINT);
+			if (i64_idx != DConstants::INVALID_INDEX) candidates.push_back(i64_idx);
+		}
+		// Strings: try VARCHAR early as a cheap candidate (format-aware types are tried in fallback anyway)
+		if (unsafe_yyjson_is_str(v)) {
+			const idx_t str_idx = FindUnionMemberById(fields, LogicalTypeId::VARCHAR);
+			if (str_idx != DConstants::INVALID_INDEX) candidates.push_back(str_idx);
 		}
 
-		auto key = unsafe_yyjson_get_first(obj);
-		auto val = yyjson_obj_iter_get_val(key);
-
-		auto tag = std::find(names.begin(), names.end(), unsafe_yyjson_get_str(key));
-		if (tag == names.end()) {
-			set_error(i, StringUtil::Format("Found object containing unknown key, instead of union: %s",
-			                                unsafe_yyjson_get_str(key)));
-			continue;
+		// Add all remaining members as fallback (in declared order)
+		for (idx_t m = 0; m < fields.size(); m++) {
+			bool already = false;
+			for (idx_t k = 0; k < candidates.size(); k++) {
+				if (candidates[k] == m) { already = true; break; }
+			}
+			if (!already) candidates.push_back(m);
 		}
 
-		idx_t actual_tag = tag - names.begin();
+		// Try candidates until one succeeds
+		bool row_done = false;
+		for (idx_t c = 0; c < candidates.size(); c++) {
+			const idx_t member_idx = candidates[c];
+			const LogicalType &member_type = fields[member_idx].second;
 
-		Vector single(UnionType::GetMemberType(type, actual_tag), 1);
-		if (!JSONTransform::Transform(&val, alc, single, 1, options, nullptr)) {
-			success = false;
+			Value child_value;
+			if (TryTransformIntoMember(v, member_type, alc, options, child_value)) {
+				// Success: commit using the *explicit* union value
+				result.SetValue(i, Value::UNION(fields, member_idx, child_value));
+				row_done = true;
+				break;
+			}
 		}
 
-		result.SetValue(i, Value::UNION(fields, actual_tag, single.GetValue(0)));
+		if (!row_done) {
+			// Nothing matched
+			Err::Set(i,
+			         StringUtil::Format("JSON transform error: unable to map value '%s' to any UNION member",
+			                             JSONCommon::ValToString(v, 50)),
+			         result, validity, options, success);
+		}
 	}
 
 	return success;
 }
+
 
 bool JSONTransform::Transform(yyjson_val *vals[], yyjson_alc *alc, Vector &result, const idx_t count,
                               JSONTransformOptions &options, optional_ptr<const ColumnIndex> column_index) {
